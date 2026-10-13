@@ -20,6 +20,7 @@ find_package(hardware_interface REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(pluginlib REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(realtime_tools REQUIRED)
 
 find_package(dynamixel_sdk REQUIRED)
@@ -35,6 +36,7 @@ add_library(
   src/dynamixel_hardware_interface.cpp
   src/dynamixel/dynamixel_info.cpp
   src/dynamixel/dynamixel.cpp
+  src/dynamixel/sync_read_rx_tracker.cpp
 )
 
 target_include_directories(
@@ -52,6 +54,7 @@ target_link_libraries(${PROJECT_NAME}
   PUBLIC
   ${hardware_interface_TARGETS}
   pluginlib::pluginlib
+  ament_index_cpp::ament_index_cpp
   rclcpp::rclcpp
   rclcpp_lifecycle::rclcpp_lifecycle
   ${dynamixel_sdk_LIBRARIES}

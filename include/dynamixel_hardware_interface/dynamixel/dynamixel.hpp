@@ -18,12 +18,14 @@
 #define DYNAMIXEL_HARDWARE_INTERFACE__DYNAMIXEL__DYNAMIXEL_HPP_
 
 #include "dynamixel_hardware_interface/dynamixel/dynamixel_info.hpp"
+#include "dynamixel_hardware_interface/dynamixel/sync_read_rx_tracker.hpp"
 #include "dynamixel_sdk/dynamixel_sdk.h"
 
 #include <map>
 #include <queue>
 #include <string>
 #include <vector>
+#include <chrono>
 #include <iostream>
 #include <cstdarg>
 #include <memory>
@@ -79,6 +81,11 @@ struct HardwareErrorStatusBitInfo
   const char * label;
   const char * description;
 };
+
+// This robot intentionally leaves the input-voltage bit out of the DYNAMIXEL
+// Shutdown mask.  The servo still reports bit 0 in Hardware Error Status, but
+// it must remain diagnostic-only rather than forcing a reboot/fault loop.
+static constexpr uint8_t kInputVoltageErrorMask = 0x01;
 
 static constexpr HardwareErrorStatusBitInfo HardwareErrorStatusTable[] = {
   {0, "Input Voltage Error", "Detects that input voltage exceeds the configured operating voltage"},
@@ -219,6 +226,10 @@ private:
   bool fast_read_permanent_ = false;
   int fast_read_fail_count_ = 0;
 
+  /// 있으면 일반 SyncRead 수신을 이 부품이 맡아 서보별 도착 여부를 남긴다.
+  /// 없으면(기본) 원래의 GroupSyncRead 경로를 그대로 쓴다.
+  std::unique_ptr<SyncReadRxTracker> sync_rx_tracker_;
+
   // indirect inform for sync read
   std::map<uint8_t /*id*/, IndirectInfo> indirect_info_read_;
 
@@ -236,12 +247,23 @@ private:
   // direct inform for bulk write
   std::map<uint8_t /*id*/, IndirectInfo> direct_info_write_;
 
+  bool IsOnlyInputVoltageAlert(uint8_t comm_id, uint8_t id, uint8_t dxl_error);
+
 public:
   explicit Dynamixel(const char * path);
   ~Dynamixel();
 
   // DXL Communication Setting
   DxlError SetupPort(const std::string & port_name, const std::string & baudrate);
+
+  /// Fast Sync/Bulk Read 사용 여부. 기본은 켜짐(상위 호환).
+  ///
+  /// Fast 방식은 여러 서보의 응답을 한 패킷으로 묶어 받으므로 빠르지만,
+  /// 하나라도 늦거나 깨지면 그 사이클 전체가 실패한다(-3001/-3002).
+  /// 게다가 한 번 성공하면 fast_read_permanent_ 가 서서 이후 실패해도
+  /// 일반 SyncRead 로 되돌아가지 않는다. 버스가 전기적으로 불안정한 장비에서는
+  /// 꺼서 서보별 읽기로 운용하는 편이 손실에 강하다.
+  void SetFastReadProtocol(bool enabled) {use_fast_read_protocol_ = enabled;}
   DxlError InitDxlComm(uint8_t comm_id, uint8_t id);
   DxlError Reboot(uint8_t id);
   void RWDataReset();
@@ -262,6 +284,16 @@ public:
   DxlError ReadMultiDxlData(double period_ms);
   // Write Item (sync or bulk)
   DxlError WriteMultiDxlData();
+
+  /// 서보별 SyncRead 수신 추적을 켠다(SyncReadRxTracker). SetMultiDxlRead() 전에 부른다.
+  void SetSyncReadRxTracking(bool enabled);
+  bool SyncReadRxTrackingEnabled() const {return sync_rx_tracker_ != nullptr;}
+  /// 마지막 일반 SyncRead 에서 이 comm_id 의 응답이 오지 않았으면 true.
+  /// 추적이 꺼져 있거나 Fast/Bulk Read 경로면 항상 false.
+  bool WasMissingInLastRead(uint8_t comm_id) const
+  {
+    return sync_rx_tracker_ && sync_rx_tracker_->WasMissing(comm_id);
+  }
 
   // Set Dxl Option
   // DxlError SetOperatingMode(uint8_t id, uint8_t dynamixel_mode);

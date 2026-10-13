@@ -55,6 +55,9 @@ namespace dynamixel_hardware_interface
  */
 constexpr char HW_IF_HARDWARE_STATE[] = "hardware_state";
 constexpr char HW_IF_TORQUE_ENABLE[] = "torque_enable";
+/// 마지막 SyncRead 에서 이 관절 서보의 응답이 오지 않았으면 그 서보의 ID,
+/// 받았으면 -1. ID 0 이 있어서 0/1 플래그 대신 이렇게 둔다.
+constexpr char HW_IF_RX_MISSING_ID[] = "rx_missing_id";
 
 /**
  * @brief Struct for handling variable types associated with Dynamixel components.
@@ -153,6 +156,28 @@ public:
   override;
 
   /**
+   * @brief Callback for the lifecycle ERROR transition.
+   *
+   * read()/write() returning ERROR takes the component to UNCONFIGURED through
+   * error(), which never calls on_deactivate(). Without this override the servos
+   * keep the torque and the last goal position with nothing driving them.
+   * @param previous_state Previous lifecycle state.
+   * @return Callback return indicating success or error.
+   */
+  DYNAMIXEL_HARDWARE_INTERFACE_PUBLIC
+  hardware_interface::CallbackReturn on_error(const rclcpp_lifecycle::State & previous_state)
+  override;
+
+  /**
+   * @brief Callback for shutdown. Also bypasses on_deactivate().
+   * @param previous_state Previous lifecycle state.
+   * @return Callback return indicating success or error.
+   */
+  DYNAMIXEL_HARDWARE_INTERFACE_PUBLIC
+  hardware_interface::CallbackReturn on_shutdown(const rclcpp_lifecycle::State & previous_state)
+  override;
+
+  /**
    * @brief Reads data from the hardware.
    * @param time Current time.
    * @param period Duration since the last read.
@@ -220,6 +245,14 @@ private:
    */
   DxlError CheckError(DxlError dxl_comm_err);
 
+  /// 마지막 SyncRead 결과로 관절별 rx_missing_id 상태 인터페이스를 채운다.
+  void UpdateRxMissingIds();
+
+  /// type=bus_timing gpio 를 읽어 버스 타이밍 상태 인터페이스를 준비한다.
+  bool SetupBusTiming(const hardware_interface::ComponentInfo & gpio);
+  /// tcdrain() 에 쓸 포트 파일 디스크립터를 /proc/self/fd 에서 찾는다 (비실시간).
+  void FindPortFd();
+
   /**
    * @brief Resets communication with the hardware.
    * @return True if the reset was successful, false otherwise.
@@ -243,6 +276,32 @@ private:
   std::vector<HandlerVarType> hdl_trans_commands_;
   std::vector<HandlerVarType> hdl_joint_states_;
   std::vector<HandlerVarType> hdl_joint_commands_;
+  std::vector<double> last_written_dxl_commands_;
+  bool have_last_written_dxl_commands_{false};
+
+  /// 버스 타이밍 진단 (xacro 의 type=bus_timing gpio). 시각은 모두
+  /// std::chrono::steady_clock 기준 초라서, 같은 프로세스의 컨트롤러가 자기
+  /// steady_clock 과 바로 빼서 "몇 ms 묵은 값인가"를 계산할 수 있다.
+  struct BusTiming
+  {
+    std::string gpio_name;
+    std::shared_ptr<double> read_ms = std::make_shared<double>(0.0);
+    std::shared_ptr<double> read_ok = std::make_shared<double>(0.0);
+    std::shared_ptr<double> read_ok_start_s = std::make_shared<double>(0.0);
+    std::shared_ptr<double> read_ok_end_s = std::make_shared<double>(0.0);
+    std::shared_ptr<double> write_sent = std::make_shared<double>(0.0);
+    std::shared_ptr<double> write_ms = std::make_shared<double>(0.0);
+    std::shared_ptr<double> write_drain_ms = std::make_shared<double>(-1.0);
+    std::vector<std::pair<std::string, std::shared_ptr<double>>> exported;
+  };
+  bool has_bus_timing_{false};
+  BusTiming bus_timing_;
+  bool measure_write_drain_{false};
+  /// 제어 루프 SyncRead 의 응답 대기 제한 [ms]. 0 이면 예전처럼 제어 주기 전체를 쓴다.
+  double read_timeout_ms_{0.0};
+  /// true 면 직전 read 가 통신 실패여도 이번 틱 명령(SyncWrite)을 보낸다.
+  bool write_on_read_failure_{false};
+  int port_fd_{-1};
 
   ///// handler sensor variable
   std::vector<HandlerVarType> hdl_gpio_sensor_states_;
@@ -305,6 +364,16 @@ private:
    * @brief Synchronizes joint commands with the joint states.
    */
   void SyncJointCommandWithStates();
+
+  /**
+   * @brief Returns true when a multi-Dynamixel command differs from the last packet sent.
+   */
+  bool MultiDxlCommandChanged() const;
+
+  /**
+   * @brief Stores the current multi-Dynamixel commands after a successful write.
+   */
+  void RememberMultiDxlCommands();
 
   /**
    * @brief Changes the torque state of the Dynamixel.

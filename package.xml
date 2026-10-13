@@ -17,6 +17,12 @@
 
   <depend>rclcpp</depend>
   <depend>hardware_interface</depend>
+  <!-- CMakeLists 가 find_package/link 하고 있으나 여기 선언이 빠져 있었다.
+       깨끗한 머신에서 rosdep install 과 colcon 빌드 순서가 어긋난다. -->
+  <depend>rclcpp_lifecycle</depend>
+  <!-- dynamixel_hardware_interface.hpp 가 get_package_share_directory 를 쓴다.
+       지금은 전이 링크로만 붙어 있다. -->
+  <depend>ament_index_cpp</depend>
   <depend>pluginlib</depend>
   <depend>realtime_tools</depend>
   <depend>dynamixel_sdk</depend>

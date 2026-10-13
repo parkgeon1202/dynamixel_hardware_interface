@@ -281,9 +281,10 @@ DxlError Dynamixel::InitDxlComm(uint8_t comm_id, uint8_t id)
     bool error_code_exists = dxl_info_.GetDxlControlItem(
       comm_id, id, "Error Code", error_code_addr, error_code_size);
 
+    bool input_voltage_error_only = false;
     if (hw_error_exists) {
       uint32_t hw_error_status = 0;
-      ReadItem(comm_id, id, "Hardware Error Status", hw_error_status);
+      const DxlError read_error = ReadItem(comm_id, id, "Hardware Error Status", hw_error_status);
 
       std::string error_string = "";
       uint8_t hw_error_byte = static_cast<uint8_t>(hw_error_status);
@@ -305,6 +306,9 @@ DxlError Dynamixel::InitDxlComm(uint8_t comm_id, uint8_t id)
           stderr, "[comm_id:%03d][ID:%03d] Hardware Error Details: 0x%x (%d): %s\n",
           comm_id, id, hw_error_byte, hw_error_byte, error_string.c_str());
       }
+      input_voltage_error_only =
+        read_error == DxlError::OK && hw_error_byte != 0 &&
+        (hw_error_byte & static_cast<uint8_t>(~kInputVoltageErrorMask)) == 0;
     } else if (error_code_exists) {
       uint32_t error_code = 0;
       ReadItem(comm_id, id, "Error Code", error_code);
@@ -331,8 +335,16 @@ DxlError Dynamixel::InitDxlComm(uint8_t comm_id, uint8_t id)
       );
     }
 
-    Reboot(id);
-    return DxlError::DXL_HARDWARE_ERROR;
+    if (input_voltage_error_only) {
+      fprintf(
+        stderr,
+        "[comm_id:%03d][ID:%03d] Input Voltage Error is diagnostic-only; "
+        "continuing without reboot.\n",
+        comm_id, id);
+    } else {
+      Reboot(id);
+      return DxlError::DXL_HARDWARE_ERROR;
+    }
   } else {
     std::string model_name = dxl_info_.GetModelName(dxl_model_number);
     fprintf(
@@ -682,6 +694,22 @@ DxlError Dynamixel::DynamixelDisable(
 //   return DxlError::OK;
 // }
 
+bool Dynamixel::IsOnlyInputVoltageAlert(uint8_t comm_id, uint8_t id, uint8_t dxl_error)
+{
+  if ((dxl_error & 0x80) == 0) {
+    return false;
+  }
+
+  uint32_t hw_error_status = 0;
+  if (ReadItem(comm_id, id, "Hardware Error Status", hw_error_status) != DxlError::OK) {
+    return false;
+  }
+
+  const uint8_t hw_error_byte = static_cast<uint8_t>(hw_error_status);
+  return hw_error_byte != 0 &&
+         (hw_error_byte & static_cast<uint8_t>(~kInputVoltageErrorMask)) == 0;
+}
+
 DxlError Dynamixel::WriteItem(uint8_t comm_id, uint8_t id, std::string item_name, uint32_t data)
 {
   uint16_t ITEM_ADDR;
@@ -732,6 +760,14 @@ DxlError Dynamixel::WriteItem(
         return DxlError::ITEM_WRITE_FAIL;
       }
     } else if (dxl_error != 0) {
+      if (IsOnlyInputVoltageAlert(comm_id, id, dxl_error)) {
+        fprintf(
+          stderr,
+          "[WriteItem][ID:%03d][comm_id:%03d] Input Voltage Error is "
+          "diagnostic-only; accepting the completed write.\n",
+          id, comm_id);
+        return DxlError::OK;
+      }
       fprintf(
         stderr,
         "[WriteItem][ID:%03d][comm_id:%03d] RX_PACKET_ERROR : %s\n",
@@ -1315,7 +1351,20 @@ DxlError Dynamixel::SetSyncReadHandler(std::vector<uint8_t> id_arr)
     }
   }
 
+  if (sync_rx_tracker_) {
+    sync_rx_tracker_->Configure(IN_ADDR, indirect_info_read_[id_arr.at(0)].size, id_arr);
+  }
+
   return DxlError::OK;
+}
+
+void Dynamixel::SetSyncReadRxTracking(bool enabled)
+{
+  if (enabled && !sync_rx_tracker_) {
+    sync_rx_tracker_ = std::make_unique<SyncReadRxTracker>();
+  } else if (!enabled) {
+    sync_rx_tracker_.reset();
+  }
 }
 
 DxlError Dynamixel::GetDxlValueFromSyncRead(double period_ms)
@@ -1386,7 +1435,9 @@ DxlError Dynamixel::GetDxlValueFromSyncRead(double period_ms)
       indirect_info_read_[id].item_size,
       it_read_data.item_data_ptr_vec,
       [this](uint8_t lambda_id, uint16_t addr, uint8_t size) {
-        return group_sync_read_->getData(lambda_id, addr, size);
+        return sync_rx_tracker_ ?
+               sync_rx_tracker_->GetData(lambda_id, addr, size) :
+               group_sync_read_->getData(lambda_id, addr, size);
       });
   }
   return DxlError::OK;
@@ -1771,6 +1822,10 @@ DxlError Dynamixel::ProcessReadCommunication(
         stderr, "%s Tx Fail [Dxl Size : %ld] [Error code : %d]\n",
         is_fast ? "FastSyncRead" : "SyncRead",
         read_data_list_.size(), dxl_comm_result);
+      if (!is_fast && sync_rx_tracker_) {
+        // 요청 자체가 나가지 않았으니 이번 틱에는 아무 응답도 받지 못했다.
+        sync_rx_tracker_->MarkAllMissing();
+      }
       return DxlError::SYNC_READ_FAIL;
     }
   } else {
@@ -1798,8 +1853,12 @@ DxlError Dynamixel::ProcessReadCommunication(
 
   // Receive packet
   if (is_sync) {
+    bool tracked = false;
     if (is_fast && group_fast_sync_read_) {
       dxl_comm_result = group_fast_sync_read_->rxPacket();
+    } else if (group_sync_read_ && sync_rx_tracker_) {
+      dxl_comm_result = sync_rx_tracker_->Receive(packet_handler_, port_handler);
+      tracked = true;
     } else if (group_sync_read_) {
       dxl_comm_result = group_sync_read_->rxPacket();
     } else {
@@ -1807,9 +1866,25 @@ DxlError Dynamixel::ProcessReadCommunication(
     }
     if (dxl_comm_result != COMM_SUCCESS) {
       fprintf(
-        stderr, "%s Rx Fail [Dxl Size : %ld] [Error code : %d]\n",
+        stderr, "%s Rx Fail [Dxl Size : %ld] [Error code : %d]",
         is_fast ? "FastSyncRead" : "SyncRead",
         read_data_list_.size(), dxl_comm_result);
+      if (tracked) {
+        // 버스 응답 순서대로 찍는다. 빠진 ID 가 하나뿐이면 그 패킷만 유실된 것이고,
+        // 어느 ID 부터 끝까지 다 빠졌으면 체인이 거기서 끊긴 것이다.
+        fprintf(stderr, " [missing IDs:");
+        for (const auto id : sync_rx_tracker_->Ids()) {
+          if (sync_rx_tracker_->WasMissing(id)) {
+            fprintf(stderr, " %u", id);
+          }
+        }
+        fprintf(stderr, "] [corrupt packets: %zu]", sync_rx_tracker_->CorruptCount());
+      }
+      fprintf(stderr, "\n");
+      // 예전에는 여기서 25개 서보에 개별 ping 을 돌렸다(5초에 한 번). 제어 스레드에서
+      // 돌아서 응답이 있을 때 약 25 ms, 버스가 죽었을 때 약 870 ms 를 잡아먹어 사이클을
+      // 건너뛰게 했다(2026-09-23 23:48 실행). 빠진 ID 는 위의 missing IDs(track_rx)가
+      // 이미 알려 주므로 뺐다.
       return DxlError::SYNC_READ_FAIL;
     }
   } else {
@@ -2063,7 +2138,11 @@ DxlError Dynamixel::SetDxlValueToSyncWrite()
 {
   for (auto it_write_data : write_data_list_) {
     uint8_t comm_id = it_write_data.comm_id;
-    uint8_t * param_write_value = new uint8_t[indirect_info_write_[comm_id].size];
+    // addParam() copies the buffer (group_sync_write.cpp:65-77), so the caller keeps
+    // ownership. This used to be `new uint8_t[...]` with no delete[] anywhere, leaking
+    // one block per servo per write cycle.
+    std::vector<uint8_t> param_write_buf(indirect_info_write_[comm_id].size, 0);
+    uint8_t * param_write_value = param_write_buf.data();
     uint8_t added_byte = 0;
 
     for (uint16_t item_index = 0; item_index < indirect_info_write_[comm_id].cnt; item_index++) {
@@ -2099,6 +2178,9 @@ DxlError Dynamixel::SetDxlValueToSyncWrite()
 
     if (group_sync_write_->addParam(comm_id, param_write_value) != true) {
       fprintf(stderr, "[ID:%03d] groupSyncWrite addparam failed\n", comm_id);
+      // Without clearParam() the id stays in the group and addParam() keeps failing
+      // for the same id on every later cycle, wedging the write path permanently.
+      group_sync_write_->clearParam();
       return DxlError::SYNC_WRITE_FAIL;
     }
   }
@@ -2264,12 +2346,15 @@ DxlError Dynamixel::SetDxlValueToBulkWrite()
 {
   for (auto it_write_data : write_data_list_) {
     uint8_t comm_id = it_write_data.comm_id;
-    uint8_t * param_write_value;
+    // See SetDxlValueToSyncWrite(): addParam() copies, so a heap array here leaked.
+    std::vector<uint8_t> param_write_buf;
+    uint8_t * param_write_value = nullptr;
     uint8_t added_byte = 0;
 
     // Check if this is a direct write
     if (direct_info_write_.find(comm_id) != direct_info_write_.end()) {
-      param_write_value = new uint8_t[direct_info_write_[comm_id].size];
+      param_write_buf.assign(direct_info_write_[comm_id].size, 0);
+      param_write_value = param_write_buf.data();
 
       for (uint16_t item_index = 0; item_index < direct_info_write_[comm_id].cnt; item_index++) {
         double data = *it_write_data.item_data_ptr_vec.at(item_index);
@@ -2309,11 +2394,15 @@ DxlError Dynamixel::SetDxlValueToBulkWrite()
           param_write_value) != true)
       {
         fprintf(stderr, "[ID:%03d] groupBulkWrite addparam failed\n", comm_id);
+        // Same reason as in SetDxlValueToSyncWrite(): leaving the id in the group
+        // makes every later addParam() for it fail too.
+        group_bulk_write_->clearParam();
         return DxlError::BULK_WRITE_FAIL;
       }
     } else {
       // Handle indirect write
-      param_write_value = new uint8_t[indirect_info_write_[comm_id].size];
+      param_write_buf.assign(indirect_info_write_[comm_id].size, 0);
+      param_write_value = param_write_buf.data();
 
       for (uint16_t item_index = 0; item_index < indirect_info_write_[comm_id].cnt; item_index++) {
         double data = *it_write_data.item_data_ptr_vec.at(item_index);
@@ -2353,6 +2442,9 @@ DxlError Dynamixel::SetDxlValueToBulkWrite()
           param_write_value) != true)
       {
         fprintf(stderr, "[ID:%03d] groupBulkWrite addparam failed\n", comm_id);
+        // Same reason as in SetDxlValueToSyncWrite(): leaving the id in the group
+        // makes every later addParam() for it fail too.
+        group_bulk_write_->clearParam();
         return DxlError::BULK_WRITE_FAIL;
       }
     }

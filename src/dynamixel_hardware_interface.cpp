@@ -26,12 +26,28 @@
 #include <unordered_map>
 #include <iomanip>
 #include <sstream>
+#include <filesystem>
+#include <system_error>
+#include <cstdlib>
+#include <termios.h>
+#include <unistd.h>
 
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/rclcpp.hpp"
 
 namespace dynamixel_hardware_interface
 {
+
+namespace
+{
+// 버스 타이밍 진단용 시각. 컨트롤러(kid_rl)의 steady_time_nanoseconds() 와 같은
+// steady_clock 이므로 둘을 빼면 바로 경과 시간이 된다.
+double SteadySeconds()
+{
+  return std::chrono::duration<double>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}  // namespace
 
 DynamixelHardware::DynamixelHardware()
 : rclcpp::Node("dynamixel_hardware_interface"),
@@ -161,11 +177,11 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
   for (const hardware_interface::ComponentInfo & gpio : info_.gpios) {
     if (gpio.parameters.find("ID") == gpio.parameters.end()) {
       RCLCPP_ERROR_STREAM(logger_, "ID is not found in gpio parameters");
-      exit(-1);
+      return hardware_interface::CallbackReturn::ERROR;
     }
     if (gpio.parameters.find("type") == gpio.parameters.end()) {
       RCLCPP_ERROR_STREAM(logger_, "type is not found in gpio parameters");
-      exit(-1);
+      return hardware_interface::CallbackReturn::ERROR;
     }
 
     uint8_t id = static_cast<uint8_t>(stoi(gpio.parameters.at("ID")));
@@ -188,15 +204,82 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
       dxl_comm_->ReadDxlModelFile(
         comm_id, id,
         static_cast<uint16_t>(stoi(gpio.parameters.at("model_num"))));
+    } else if (type == "bus_timing") {
+      // 서보가 아니라 이 드라이버 자신의 측정값을 내보내는 가상 gpio. ID 는 쓰지 않는다.
+      if (!SetupBusTiming(gpio)) {
+        return hardware_interface::CallbackReturn::ERROR;
+      }
     } else {
       RCLCPP_ERROR_STREAM(logger_, "Invalid DXL / Sensor type");
-      exit(-1);
+      return hardware_interface::CallbackReturn::ERROR;
     }
+  }
+
+  // Fast Sync Read 는 25개 응답을 한 패킷으로 묶어 받기 때문에 하나만 실패해도
+  // 사이클 전체가 날아간다. 버스가 불안정하면 꺼서 개별 읽기로 돌리는 편이 낫다.
+  if (info_.hardware_parameters.find("use_fast_read_protocol") !=
+    info_.hardware_parameters.end())
+  {
+    const bool use_fast = info_.hardware_parameters.at("use_fast_read_protocol") == "true";
+    dxl_comm_->SetFastReadProtocol(use_fast);
+    RCLCPP_INFO_STREAM(
+      logger_, "Fast Sync/Bulk Read is " << (use_fast ? "enabled" : "disabled") <<
+        " by the use_fast_read_protocol parameter.");
+  }
+
+  // 진단용. 켜면 일반 SyncRead 수신을 SyncReadRxTracker 가 맡아 서보별 응답 도착
+  // 여부를 남기고, 실패 로그에 빠진 ID 를 찍고, 관절의 rx_missing_id 상태
+  // 인터페이스를 채운다. 끄면(기본) 원래의 SDK 수신 경로를 그대로 쓴다.
+  if (info_.hardware_parameters.find("track_sync_read_rx") !=
+    info_.hardware_parameters.end())
+  {
+    const bool track = info_.hardware_parameters.at("track_sync_read_rx") == "true";
+    dxl_comm_->SetSyncReadRxTracking(track);
+    RCLCPP_INFO_STREAM(
+      logger_, "SyncRead RX tracking is " << (track ? "enabled" : "disabled") <<
+        " by the track_sync_read_rx parameter.");
   }
 
   if (dxl_comm_->SetupPort(port_name_, baud_rate_) != DxlError::OK) {
     return hardware_interface::CallbackReturn::ERROR;
   }
+
+  // 진단용. 켜면 매 SyncWrite 뒤 tcdrain() 으로 송신 큐가 빌 때까지 기다린 시간을
+  // write_drain_ms 로 남긴다. 제어 스레드를 그만큼 막고, 커널이 USB 시리얼의
+  // '송신 완료'를 주기적으로 확인하는 방식이라 값이 커널 틱 단위로 부풀 수 있다.
+  // 그래서 기본은 꺼 두고, 측정할 때만 켠다.
+  if (info_.hardware_parameters.find("measure_write_drain") !=
+    info_.hardware_parameters.end())
+  {
+    measure_write_drain_ = info_.hardware_parameters.at("measure_write_drain") == "true";
+  }
+  if (has_bus_timing_ && measure_write_drain_) {
+    FindPortFd();
+  }
+
+  // A. 제어 루프 SyncRead 의 응답 대기 제한. 예전에는 제어 주기(50 Hz 에서 20 ms)를
+  // 통째로 기다려서, 응답 하나만 빠져도 read 가 20 ms 를 쓰고 사이클이 주기를 넘겨
+  // 다음 칸 하나를 건너뛰었다. 0 이면 예전 동작.
+  if (info_.hardware_parameters.find("read_timeout_ms") != info_.hardware_parameters.end()) {
+    read_timeout_ms_ = std::stod(info_.hardware_parameters.at("read_timeout_ms"));
+    if (!std::isfinite(read_timeout_ms_) || read_timeout_ms_ < 0.0) {
+      RCLCPP_ERROR_STREAM(logger_, "read_timeout_ms must be a finite value >= 0");
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+  }
+  // B. read 가 통신 실패로 끝나도 write 는 한다. 예전에는 dxl_status_ 가 COMM_ERROR 면
+  // write() 가 전송을 건너뛰어, 새 명령이 다음 성공 사이클까지(약 60 ms) 나가지 않았다.
+  // SyncWrite 는 응답을 기다리지 않으므로 read 실패와 무관하게 보낼 수 있다.
+  if (info_.hardware_parameters.find("write_on_read_failure") !=
+    info_.hardware_parameters.end())
+  {
+    write_on_read_failure_ = info_.hardware_parameters.at("write_on_read_failure") == "true";
+  }
+  RCLCPP_INFO_STREAM(
+    logger_, "Control-loop read timeout: " <<
+      (read_timeout_ms_ > 0.0 ? std::to_string(read_timeout_ms_) + " ms" :
+      std::string("controller period")) <<
+      ", write on read failure: " << (write_on_read_failure_ ? "on" : "off"));
 
   std::vector<uint8_t> reboot_dxl;
   for (const hardware_interface::ComponentInfo & gpio : info_.gpios) {
@@ -221,6 +304,9 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
     uint8_t comm_id = (gpio.parameters.find("comm_id") != gpio.parameters.end()) ?
       static_cast<uint8_t>(stoi(gpio.parameters.at("comm_id"))) : id;
     const std::string & type = gpio.parameters.at("type");
+    if (type == "bus_timing") {
+      continue;  // 서보가 아니다. ping 도 레지스터 쓰기(InitItem)도 하면 안 된다.
+    }
 
     bool requires_ping = (type == "controller" || type == "dxl" || type == "sensor");
     if (requires_ping) {
@@ -272,7 +358,7 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
     return hardware_interface::CallbackReturn::ERROR;
   }
 
-  if (num_of_transmissions_ != hdl_trans_commands_.size() &&
+  if (num_of_transmissions_ != hdl_trans_commands_.size() ||
     num_of_transmissions_ != hdl_trans_states_.size())
   {
     RCLCPP_ERROR_STREAM(
@@ -289,6 +375,12 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
     temp_state.name = joint.name;
 
     for (auto it : joint.state_interfaces) {
+      if (HW_IF_RX_MISSING_ID == it.name) {
+        // 0 은 "ID 0 이 빠졌다" 는 뜻이 되므로 -1(받음)로 시작한다.
+        temp_state.interface_name_vec.push_back(it.name);
+        temp_state.value_ptr_vec.push_back(std::make_shared<double>(-1.0));
+        continue;
+      }
       if (hardware_interface::HW_IF_POSITION != it.name &&
         hardware_interface::HW_IF_VELOCITY != it.name &&
         hardware_interface::HW_IF_ACCELERATION != it.name &&
@@ -327,12 +419,12 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
     hdl_joint_commands_.push_back(temp_cmd);
   }
 
-  if (num_of_joints_ != hdl_joint_commands_.size() &&
+  if (num_of_joints_ != hdl_joint_commands_.size() ||
     num_of_joints_ != hdl_joint_states_.size())
   {
     RCLCPP_ERROR_STREAM(
       logger_, "Error: number of joints " << num_of_joints_ << ", " <<
-        hdl_joint_commands_.size() << ", " << hdl_joint_commands_.size());
+        hdl_joint_commands_.size() << ", " << hdl_joint_states_.size());
     return hardware_interface::CallbackReturn::ERROR;
   }
 
@@ -473,6 +565,11 @@ DynamixelHardware::export_state_interfaces()
             it.name, it.interface_name_vec.at(i), it.value_ptr_vec.at(i).get()));
       }
     }
+    for (const auto & entry : bus_timing_.exported) {
+      state_interfaces.emplace_back(
+        hardware_interface::StateInterface(
+          bus_timing_.gpio_name, entry.first, entry.second.get()));
+    }
   } catch (const std::exception & e) {
     RCLCPP_ERROR_STREAM(logger_, "Error in export_state_interfaces: " << e.what());
   }
@@ -547,6 +644,26 @@ hardware_interface::CallbackReturn DynamixelHardware::on_deactivate(
   return stop();
 }
 
+hardware_interface::CallbackReturn DynamixelHardware::on_error(
+  [[maybe_unused]] const rclcpp_lifecycle::State & previous_state)
+{
+  RCLCPP_ERROR_STREAM(
+    logger_, "Dynamixel Hardware entered the ERROR state: disabling torque on all servos.");
+  stop();
+  // SUCCESS puts the component in UNCONFIGURED, from which it can be brought back
+  // with set_hardware_component_state(). Returning ERROR would make it FINALIZED,
+  // i.e. only recoverable by restarting the process.
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+hardware_interface::CallbackReturn DynamixelHardware::on_shutdown(
+  [[maybe_unused]] const rclcpp_lifecycle::State & previous_state)
+{
+  RCLCPP_INFO_STREAM(logger_, "Dynamixel Hardware shutting down: disabling torque on all servos.");
+  stop();
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
 hardware_interface::CallbackReturn DynamixelHardware::start()
 {
   rclcpp::Time start_time = this->now();
@@ -572,7 +689,9 @@ hardware_interface::CallbackReturn DynamixelHardware::start()
 
   CalcJointToTransmission();
 
-  dxl_comm_->WriteMultiDxlData();
+  if (dxl_comm_->WriteMultiDxlData() == DxlError::OK) {
+    RememberMultiDxlCommands();
+  }
 
   if (torque_enabled_comm_id_id_.size() > 0) {
     RCLCPP_INFO_STREAM(logger_, "Enabling torque for Dynamixels");
@@ -614,7 +733,25 @@ hardware_interface::return_type DynamixelHardware::read(
     RCLCPP_ERROR_STREAM(logger_, "Dynamixel Read Fail : REBOOTING");
     return hardware_interface::return_type::ERROR;
   } else if (dxl_status_ == DXL_OK || dxl_status_ == COMM_ERROR || dxl_status_ == HW_ERROR) {
-    dxl_comm_err_ = CheckError(dxl_comm_->ReadMultiDxlData(period_ms));
+    const double read_start_s = SteadySeconds();
+    const double read_timeout_ms = read_timeout_ms_ > 0.0 ? read_timeout_ms_ : period_ms;
+    const DxlError read_result = dxl_comm_->ReadMultiDxlData(read_timeout_ms);
+    const double read_end_s = SteadySeconds();
+    if (has_bus_timing_) {
+      // 서보들은 SyncRead 응답을 만드는 순간 자기 값을 찍으므로, 성공한 읽기의
+      // [시작, 끝] 사이가 관절값의 샘플링 시각이다. 실패하면 이전 성공 시각이
+      // 그대로 남아, 컨트롤러가 계산하는 관절값 나이가 자연스럽게 늘어난다.
+      *bus_timing_.read_ms = (read_end_s - read_start_s) * 1000.0;
+      *bus_timing_.read_ok = read_result == DxlError::OK ? 1.0 : 0.0;
+      if (read_result == DxlError::OK) {
+        *bus_timing_.read_ok_start_s = read_start_s;
+        *bus_timing_.read_ok_end_s = read_end_s;
+      }
+    }
+    dxl_comm_err_ = CheckError(read_result);
+    if (dxl_comm_->SyncReadRxTrackingEnabled()) {
+      UpdateRxMissingIds();
+    }
     if (dxl_comm_err_ != DxlError::OK && dxl_comm_err_ != DxlError::DXL_HARDWARE_ERROR) {
       if (!is_read_in_error_) {
         is_read_in_error_ = true;
@@ -667,14 +804,54 @@ hardware_interface::return_type DynamixelHardware::read(
 hardware_interface::return_type DynamixelHardware::write(
   [[maybe_unused]] const rclcpp::Time & time, const rclcpp::Duration & period)
 {
-  if (dxl_status_ == DXL_OK || dxl_status_ == HW_ERROR) {
+  // 이번 틱에 SyncWrite 를 보내지 않는 모든 경로(명령 불변, 직전 read 실패로 인한
+  // 건너뜀)에서 0 이 남도록 분기 전에 초기화한다. 예전에는 아래 if 안에서만 해서,
+  // read 실패로 else 분기를 타면 직전 틱의 write_sent=1 이 그대로 기록됐다.
+  if (has_bus_timing_) {
+    *bus_timing_.write_sent = 0.0;
+    *bus_timing_.write_ms = 0.0;
+    *bus_timing_.write_drain_ms = -1.0;
+  }
+  if (dxl_status_ == DXL_OK || dxl_status_ == HW_ERROR ||
+    (write_on_read_failure_ && dxl_status_ == COMM_ERROR))
+  {
     dxl_comm_->WriteItemBuf();
 
     ChangeDxlTorqueState();
 
     CalcJointToTransmission();
 
-    dxl_comm_->WriteMultiDxlData();
+    if (MultiDxlCommandChanged()) {
+      const double write_start_s = SteadySeconds();
+      const auto write_result = dxl_comm_->WriteMultiDxlData();
+      if (has_bus_timing_) {
+        // write_ms 는 SyncWrite 호출이 돌아오기까지(바이트를 커널에 넘기기까지)다.
+        // 선 위 전송은 그 뒤에 일어나며, 그 끝은 write_drain_ms 로만 보인다.
+        *bus_timing_.write_sent = write_result == DxlError::OK ? 1.0 : 0.0;
+        *bus_timing_.write_ms = (SteadySeconds() - write_start_s) * 1000.0;
+        if (write_result == DxlError::OK && measure_write_drain_ && port_fd_ >= 0 &&
+          ::tcdrain(port_fd_) == 0)
+        {
+          *bus_timing_.write_drain_ms = (SteadySeconds() - write_start_s) * 1000.0;
+        }
+      }
+      if (write_result == DxlError::OK) {
+        RememberMultiDxlCommands();
+      } else {
+        // A TX-only failure is invisible to dxl_status_, which only read()'s
+        // CheckError() updates. Without this branch the commands silently stop
+        // reaching the servos while write() keeps reporting OK.
+        write_error_duration_ = write_error_duration_ + period;
+        RCLCPP_ERROR_STREAM_THROTTLE(
+          logger_, clock_, 1000,
+          "Dynamixel Write Fail (Duration: " << write_error_duration_.seconds() * 1000 << "ms/" <<
+            err_timeout_ms_ << "ms): " << Dynamixel::DxlErrorToString(write_result));
+        if (write_error_duration_.seconds() * 1000 >= err_timeout_ms_) {
+          return hardware_interface::return_type::ERROR;
+        }
+        return hardware_interface::return_type::OK;
+      }
+    }
 
     is_write_in_error_ = false;
     write_error_duration_ = rclcpp::Duration(0, 0);
@@ -693,6 +870,120 @@ hardware_interface::return_type DynamixelHardware::write(
     }
     return hardware_interface::return_type::OK;
   }
+}
+
+bool DynamixelHardware::MultiDxlCommandChanged() const
+{
+  if (!have_last_written_dxl_commands_) {
+    return true;
+  }
+
+  std::size_t index = 0;
+  const auto handler_changed = [this, &index](const auto & handlers) {
+      for (const auto & handler : handlers) {
+        for (const auto & value : handler.value_ptr_vec) {
+          if (index >= last_written_dxl_commands_.size() ||
+            *value != last_written_dxl_commands_[index++])
+          {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+  if (handler_changed(hdl_trans_commands_) ||
+    handler_changed(hdl_gpio_controller_commands_))
+  {
+    return true;
+  }
+  return index != last_written_dxl_commands_.size();
+}
+
+void DynamixelHardware::RememberMultiDxlCommands()
+{
+  std::size_t command_count = 0;
+  for (const auto & handler : hdl_trans_commands_) {
+    command_count += handler.value_ptr_vec.size();
+  }
+  for (const auto & handler : hdl_gpio_controller_commands_) {
+    command_count += handler.value_ptr_vec.size();
+  }
+
+  last_written_dxl_commands_.resize(command_count);
+  std::size_t index = 0;
+  for (const auto & handler : hdl_trans_commands_) {
+    for (const auto & value : handler.value_ptr_vec) {
+      last_written_dxl_commands_[index++] = *value;
+    }
+  }
+  for (const auto & handler : hdl_gpio_controller_commands_) {
+    for (const auto & value : handler.value_ptr_vec) {
+      last_written_dxl_commands_[index++] = *value;
+    }
+  }
+  have_last_written_dxl_commands_ = true;
+}
+
+bool DynamixelHardware::SetupBusTiming(const hardware_interface::ComponentInfo & gpio)
+{
+  const std::vector<std::pair<std::string, std::shared_ptr<double>>> known = {
+    {"read_ms", bus_timing_.read_ms},
+    {"read_ok", bus_timing_.read_ok},
+    {"read_ok_start_s", bus_timing_.read_ok_start_s},
+    {"read_ok_end_s", bus_timing_.read_ok_end_s},
+    {"write_sent", bus_timing_.write_sent},
+    {"write_ms", bus_timing_.write_ms},
+    {"write_drain_ms", bus_timing_.write_drain_ms},
+  };
+  if (has_bus_timing_) {
+    RCLCPP_ERROR_STREAM(logger_, "Only one bus_timing gpio is allowed");
+    return false;
+  }
+  bus_timing_.gpio_name = gpio.name;
+  for (const auto & state : gpio.state_interfaces) {
+    bool found = false;
+    for (const auto & entry : known) {
+      if (entry.first == state.name) {
+        bus_timing_.exported.push_back(entry);
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      RCLCPP_ERROR_STREAM(
+        logger_, "Unknown bus_timing state interface '" << state.name << "' on " << gpio.name);
+      return false;
+    }
+  }
+  has_bus_timing_ = true;
+  RCLCPP_INFO_STREAM(
+    logger_, "Bus timing diagnostics exported on gpio '" << gpio.name << "' (" <<
+      bus_timing_.exported.size() << " interfaces)");
+  return true;
+}
+
+void DynamixelHardware::FindPortFd()
+{
+  // SDK 의 PortHandler 는 fd 를 내주지 않는다. 같은 프로세스가 연 fd 중
+  // 포트 장치(심볼릭 링크를 풀어서)와 같은 것을 찾는다. on_init 에서 한 번만 부른다.
+  std::error_code error;
+  const auto target = std::filesystem::canonical(port_name_, error);
+  if (error) {
+    RCLCPP_WARN_STREAM(logger_, "write_drain_ms disabled: cannot resolve " << port_name_);
+    return;
+  }
+  for (const auto & entry : std::filesystem::directory_iterator("/proc/self/fd", error)) {
+    std::error_code link_error;
+    const auto link = std::filesystem::read_symlink(entry.path(), link_error);
+    if (!link_error && link == target) {
+      port_fd_ = std::atoi(entry.path().filename().c_str());
+      RCLCPP_INFO_STREAM(
+        logger_, "write_drain_ms enabled on fd " << port_fd_ << " (" << target.string() << ")");
+      return;
+    }
+  }
+  RCLCPP_WARN_STREAM(logger_, "write_drain_ms disabled: no open fd for " << target.string());
 }
 
 DxlError DynamixelHardware::CheckError(DxlError dxl_comm_err)
@@ -716,11 +1007,21 @@ DxlError DynamixelHardware::CheckError(DxlError dxl_comm_err)
         dxl_hw_err_[hdl_trans_states_.at(i).id] =
           static_cast<uint8_t>(*hdl_trans_states_.at(i).value_ptr_vec.at(j));
         uint8_t hw_error_status = static_cast<uint8_t>(dxl_hw_err_[hdl_trans_states_.at(i).id]);
+        const uint8_t fatal_hw_error_status = static_cast<uint8_t>(
+          hw_error_status & static_cast<uint8_t>(~kInputVoltageErrorMask));
         std::string error_string = "";
+
+        if ((hw_error_status & kInputVoltageErrorMask) != 0) {
+          RCLCPP_WARN_STREAM_THROTTLE(
+            logger_, clock_, 1000,
+            "Dynamixel Input Voltage Error [ID:" <<
+              static_cast<int>(hdl_trans_states_.at(i).id) <<
+              "] is diagnostic-only and does not fault the hardware interface");
+        }
 
         // Check each bit in the hardware error status
         for (int bit = 0; bit < 8; ++bit) {
-          if (hw_error_status & (1 << bit)) {
+          if (fatal_hw_error_status & (1 << bit)) {
             const HardwareErrorStatusBitInfo * bit_info = get_hardware_error_status_bit_info(bit);
             if (bit_info) {
               error_string += bit_info->label;
@@ -780,6 +1081,28 @@ DxlError DynamixelHardware::CheckError(DxlError dxl_comm_err)
   }
 
   return error_state;
+}
+
+void DynamixelHardware::UpdateRxMissingIds()
+{
+  // 관절 j 의 값은 그 관절에 걸린 서보(transmission_to_joint_matrix_ 에서 계수가
+  // 0 이 아닌 것) 중 응답이 빠진 첫 서보의 ID. 1:1 매핑이면 그 관절 서보의 ID 다.
+  for (size_t j = 0; j < num_of_joints_; j++) {
+    double missing_id = -1.0;
+    for (size_t t = 0; t < num_of_transmissions_; t++) {
+      if (transmission_to_joint_matrix_[j][t] != 0.0 &&
+        dxl_comm_->WasMissingInLastRead(hdl_trans_states_.at(t).comm_id))
+      {
+        missing_id = static_cast<double>(hdl_trans_states_.at(t).id);
+        break;
+      }
+    }
+    for (size_t k = 0; k < hdl_joint_states_.at(j).interface_name_vec.size(); k++) {
+      if (hdl_joint_states_.at(j).interface_name_vec.at(k) == HW_IF_RX_MISSING_ID) {
+        *hdl_joint_states_.at(j).value_ptr_vec.at(k) = missing_id;
+      }
+    }
+  }
 }
 
 bool DynamixelHardware::CommReset()
