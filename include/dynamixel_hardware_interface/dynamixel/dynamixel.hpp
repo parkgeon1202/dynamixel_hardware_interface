@@ -17,7 +17,7 @@
 // Modifications Copyright 2026 parkgeon1202 (kid_rl): input-voltage alert handling,
 // SyncRead RX tracking, bus timing diagnostics, read timeout, write-on-change,
 // on_error/on_shutdown torque-off, gpio command initial values, and bug fixes.
-// See the "About this fork" section of README.md.
+// See README.md for details.
 
 #ifndef DYNAMIXEL_HARDWARE_INTERFACE__DYNAMIXEL__DYNAMIXEL_HPP_
 #define DYNAMIXEL_HARDWARE_INTERFACE__DYNAMIXEL__DYNAMIXEL_HPP_
