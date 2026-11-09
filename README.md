@@ -38,66 +38,20 @@ Only the hardware interface is forked. DynamixelSDK and dynamixel_interfaces are
 
 ## 2. Changes from upstream
 
-For each change: its purpose, how it is implemented, and where kid_rl uses it.
+For each change: its purpose, how it is implemented, how to enable it, and where kid_rl uses it.
 
-### ① Input Voltage Error is logged, not treated as a fault
-- **Purpose:** When the robot walks, the battery voltage dips for a moment and the servos raise Hardware Error bit 0 (Input Voltage). Upstream treats this as a fault and goes to Reboot or ERROR. Torque then drops during walking, or the servos keep rebooting.
-- **Implementation:** Added `kInputVoltageErrorMask = 0x01` to `dynamixel.hpp`. When bit 0 is the **only** bit set:
-  - `InitDxlComm`: continues without rebooting.
-  - `WriteItem`: checks with `IsOnlyInputVoltageAlert()`, then accepts the write as successful.
-  - `CheckError`: logs a warning at most once per second and leaves the bit out of the fault decision.
-  - If any other bit (overheating, overload, ...) is set as well, it is a fault, as upstream.
-- **kid_rl:** The policy keeps running through voltage dips. Voltage is recorded separately in the CSV `vin_*` columns, and errors in the `hwerr_*` columns.
-
-### ② Switch to turn Fast Sync Read on or off (`use_fast_read_protocol`)
-- **Purpose:** Fast Sync Read receives the replies of all servos in one packet, so if a single servo fails, the whole cycle is lost. On top of that, once it has succeeded, `fast_read_permanent_` is set and the driver never falls back to plain SyncRead, even when it fails later.
-- **Implementation:** Added `SetFastReadProtocol()`, set from a hardware parameter.
-- **kid_rl:** Set to `false` in `kid_dynamixel.ros2_control.xacro`, so it uses plain SyncRead, where each servo replies separately.
-
-### ③ Per-servo reception tracking: `SyncReadRxTracker` + `rx_missing_id` (2 new files)
-- **Purpose:** The SDK's `GroupSyncRead::rxPacket()` returns at the first failure, so it cannot tell **which servo's reply was missing**.
-- **Implementation:**
-  - `sync_read_rx_tracker.cpp` receives every packet that arrives before the timeout, and records for each ID whether it arrived, plus the number of CRC-corrupt packets. Its buffers are allocated in advance, and it allocates no memory while receiving.
-  - Failure logs print `[missing IDs: ...] [corrupt packets: n]`.
-  - Each joint exports an `rx_missing_id` state interface. Its value is the ID of the missing servo, or −1 if everything arrived.
-  - Upstream pinged every servo one by one in the control thread whenever a read failed. That stalled the loop for 870 ms when the bus was down, so it was removed.
-- **How to enable:** The `track_sync_read_rx` parameter. Off by default, and when it is off the original path is used unchanged.
-- **kid_rl:** `rx_missing_monitor.cpp` reads this value and records it in the CSV `rx_missing_count` and `rx_missing_ids` columns.
-
-### ④ Virtual gpio for bus timing measurement (`type=bus_timing`)
-- **Purpose:** To measure how many ms old the joint readings are, how long a read took, and whether a write actually went out.
-- **Implementation:**
-  - A virtual gpio that is not a servo (`SetupBusTiming`) exports 7 values: `read_ms`, `read_ok`, `read_ok_start_s`, `read_ok_end_s`, `write_sent`, `write_ms`, `write_drain_ms`.
-  - Times are based on `steady_clock`, so the controller can subtract them directly from its own clock.
-  - This gpio is skipped during ping and register initialisation.
-  - With `measure_write_drain` on, the driver finds the port's fd in `/proc/self/fd` (`FindPortFd`) and uses `tcdrain()` to measure until transmission has actually finished.
-- **kid_rl:** `bus_timing_monitor.cpp` computes `joint_age_min_ms` / `joint_age_max_ms` and records them in the CSV together with the `read_ms`, `read_ok` and `prev_write_*` columns.
-
-### ⑤ Limit on read reply wait time (`read_timeout_ms`)
-- **Purpose:** Upstream waits for replies for the whole control period (20 ms). If even one reply was missing, that cycle overran its period and the next tick was skipped.
-- **kid_rl:** Set to 14 ms in the xacro.
-
-### ⑥ Send the write even when the read failed (`write_on_read_failure`)
-- **Purpose:** Upstream skips the write when the read ends in a communication error (`COMM_ERROR`), so the new policy target did not reach the servos for about 60 ms. SyncWrite does not wait for replies, so it can be sent regardless of the read failure.
-- **kid_rl:** Set to `true`. The target joint angles from the policy go out every tick.
-
-### ⑦ Write only when the command changed + detect write failures
-- **Implementation:**
-  - With `MultiDxlCommandChanged()` and `RememberMultiDxlCommands()`, SyncWrite is skipped when the values are the same as the last ones sent. This reduces bus load.
-  - In upstream, a failure that happens only on transmit is not caught by `dxl_status_`, so commands silently stopped. Now the failure time is accumulated, and once it exceeds `err_timeout_ms`, ERROR is returned.
-- **kid_rl:** Checked with the CSV `prev_write_sent` column. When the target stays the same, as in SAFE_HOLD, it shows 0.
-
-### ⑧ Torque off on error and shutdown (`on_error`, `on_shutdown`)
-- **Purpose:** In upstream, when read/write ends in ERROR, `on_deactivate` is never called. The servos then **keep their last goal position with torque on**. This is a robot safety problem.
-- **Implementation:** Both cases turn torque off with `stop()`. Because `on_error` returns SUCCESS, the component goes to UNCONFIGURED and can be brought back without restarting the process.
-
-### ⑨ Initial value of gpio commands taken from the param (`InitialCommandValue`)
-- **Purpose:** When `Position P Gain` is opened as a command interface, the first SyncWrite in `start()` writes **P gain 0** to the servos before the controller has written a value.
-- **Implementation:** If there is a `<param>` with the same name, the command starts from that value. Otherwise it starts from 0, as before. Goal Position is not affected, because `start()` overwrites it with the present position.
-- **kid_rl:** `configure_gains()` in `kid_rl_controller.cpp` uses this command interface to switch gains: the trained gain while walking, and `motion_gain.p_gains` during motions such as SAFE_HOLD. In the xacro the initial value is given with `<param name="Position P Gain">${kp}</param>`.
-
-### ⑩ Bug fixes in upstream
-See [Bug fixes](#4-bug-fixes) below. These are not specific to kid_rl and could be sent upstream as pull requests.
+| # | Change | Purpose | Implementation | How to enable | Use in kid_rl |
+|---|---|---|---|---|---|
+| ① | **Input Voltage Error is logged, not treated as a fault** | When the robot walks, the battery voltage dips for a moment and the servos raise Hardware Error bit 0 (Input Voltage). Upstream treats this as a fault and goes to Reboot or ERROR. Torque then drops during walking, or the servos keep rebooting. | Added `kInputVoltageErrorMask = 0x01` to `dynamixel.hpp`. When bit 0 is the **only** bit set:<br>• `InitDxlComm`: continues without rebooting.<br>• `WriteItem`: checks with `IsOnlyInputVoltageAlert()`, then accepts the write as successful.<br>• `CheckError`: logs a warning at most once per second and leaves the bit out of the fault decision.<br>If any other bit (overheating, overload, ...) is set as well, it is a fault, as upstream. | Always on | The policy keeps running through voltage dips. Voltage is recorded separately in the CSV `vin_*` columns, and errors in the `hwerr_*` columns. |
+| ② | **Switch to turn Fast Sync Read on or off** | Fast Sync Read receives the replies of all servos in one packet, so if a single servo fails, the whole cycle is lost. On top of that, once it has succeeded, `fast_read_permanent_` is set and the driver never falls back to plain SyncRead, even when it fails later. | Added `SetFastReadProtocol()`, set from a hardware parameter. | `use_fast_read_protocol` (default `true`) | Set to `false` in `kid_dynamixel.ros2_control.xacro`, so it uses plain SyncRead, where each servo replies separately. |
+| ③ | **Per-servo reception tracking:** `SyncReadRxTracker` + `rx_missing_id` (2 new files) | The SDK's `GroupSyncRead::rxPacket()` returns at the first failure, so it cannot tell **which servo's reply was missing**. | • `sync_read_rx_tracker.cpp` receives every packet that arrives before the timeout, and records for each ID whether it arrived, plus the number of CRC-corrupt packets. Its buffers are allocated in advance, and it allocates no memory while receiving.<br>• Failure logs print `[missing IDs: ...] [corrupt packets: n]`.<br>• Each joint exports an `rx_missing_id` state interface: the ID of the missing servo, or −1 if everything arrived.<br>• Upstream pinged every servo one by one in the control thread whenever a read failed. That stalled the loop for 870 ms when the bus was down, so it was removed. | `track_sync_read_rx` (default off; when off, the original path is used unchanged) | `rx_missing_monitor.cpp` reads this value and records it in the CSV `rx_missing_count` and `rx_missing_ids` columns. |
+| ④ | **Virtual gpio for bus timing measurement** | To measure how many ms old the joint readings are, how long a read took, and whether a write actually went out. | • A virtual gpio that is not a servo (`SetupBusTiming`) exports 7 values: `read_ms`, `read_ok`, `read_ok_start_s`, `read_ok_end_s`, `write_sent`, `write_ms`, `write_drain_ms`.<br>• Times are based on `steady_clock`, so the controller can subtract them directly from its own clock.<br>• This gpio is skipped during ping and register initialisation.<br>• With `measure_write_drain` on, the driver finds the port's fd in `/proc/self/fd` (`FindPortFd`) and uses `tcdrain()` to measure until transmission has actually finished. | A gpio with `type=bus_timing`; optional `measure_write_drain` | `bus_timing_monitor.cpp` computes `joint_age_min_ms` / `joint_age_max_ms` and records them in the CSV together with the `read_ms`, `read_ok` and `prev_write_*` columns. |
+| ⑤ | **Limit on read reply wait time** | Upstream waits for replies for the whole control period (20 ms). If even one reply was missing, that cycle overran its period and the next tick was skipped. | The control-loop SyncRead uses `read_timeout_ms` as its wait limit instead of the period. | `read_timeout_ms` (`0` = upstream behaviour) | Set to 14 ms in the xacro. |
+| ⑥ | **Send the write even when the read failed** | Upstream skips the write when the read ends in a communication error (`COMM_ERROR`), so the new policy target did not reach the servos for about 60 ms. SyncWrite does not wait for replies, so it can be sent regardless of the read failure. | `write()` also sends commands when the status is `COMM_ERROR`. | `write_on_read_failure` | Set to `true`. The target joint angles from the policy go out every tick. |
+| ⑦ | **Write only when the command changed + detect write failures** | Reduce bus load, and stop commands from silently not reaching the servos. | • With `MultiDxlCommandChanged()` and `RememberMultiDxlCommands()`, SyncWrite is skipped when the values are the same as the last ones sent.<br>• In upstream, a failure that happens only on transmit is not caught by `dxl_status_`, so commands silently stopped. Now the failure time is accumulated, and once it exceeds `err_timeout_ms`, ERROR is returned. | Always on | Checked with the CSV `prev_write_sent` column. When the target stays the same, as in SAFE_HOLD, it shows 0. |
+| ⑧ | **Torque off on error and shutdown** (`on_error`, `on_shutdown`) | In upstream, when read/write ends in ERROR, `on_deactivate` is never called. The servos then **keep their last goal position with torque on**. This is a robot safety problem. | Both cases turn torque off with `stop()`. Because `on_error` returns SUCCESS, the component goes to UNCONFIGURED and can be brought back without restarting the process. | Always on | The robot goes limp instead of holding its last pose when the bus fails or the controller manager shuts down. |
+| ⑨ | **Initial value of gpio commands taken from the param** (`InitialCommandValue`) | When `Position P Gain` is opened as a command interface, the first SyncWrite in `start()` writes **P gain 0** to the servos before the controller has written a value. | If there is a `<param>` with the same name, the command starts from that value. Otherwise it starts from 0, as before. Goal Position is not affected, because `start()` overwrites it with the present position. | A `<param>` with the same name as the command interface | `configure_gains()` in `kid_rl_controller.cpp` uses this command interface to switch gains: the trained gain while walking, and `motion_gain.p_gains` during motions such as SAFE_HOLD. In the xacro the initial value is given with `<param name="Position P Gain">${kp}</param>`. |
+| ⑩ | **Bug fixes in upstream** | See [Bug fixes](#4-bug-fixes) below. | | No configuration needed | Not specific to kid_rl; these could be sent upstream as pull requests. |
 
 ---
 
