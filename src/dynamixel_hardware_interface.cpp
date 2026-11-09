@@ -1410,6 +1410,27 @@ bool DynamixelHardware::InitDxlReadItems()
   return true;
 }
 
+// gpio command 의 시작값. 같은 이름의 gpio <param> 이 있으면 그 값, 없으면 0.
+// Goal Position 이 아닌 항목(예: Position P Gain)을 command 로 열 때 필요하다: start() 의 첫
+// SyncWrite 는 컨트롤러가 값을 쓰기 전에 나가므로, 0 에서 시작하면 그 항목이 서보에 0 으로 써진다.
+// Goal Position 은 start() 가 현재 위치로 덮어쓰므로 영향이 없다.
+double DynamixelHardware::InitialCommandValue(
+  const hardware_interface::ComponentInfo & gpio, const std::string & name) const
+{
+  const auto it = gpio.parameters.find(name);
+  if (it == gpio.parameters.end()) {
+    return 0.0;
+  }
+  try {
+    return std::stod(it->second);
+  } catch (const std::exception &) {
+    RCLCPP_ERROR_STREAM(
+      logger_, gpio.name << ": param '" << name << "' is not a number ('" << it->second <<
+        "'); command starts at 0");
+    return 0.0;
+  }
+}
+
 bool DynamixelHardware::InitDxlWriteItems()
 {
   RCLCPP_INFO_STREAM(logger_, "$$$$$ Init Dxl Write Items");
@@ -1434,7 +1455,8 @@ bool DynamixelHardware::InitDxlWriteItems()
           //   continue;
           // }
           temp_write.interface_name_vec.push_back(it.name);
-          temp_write.value_ptr_vec.push_back(std::make_shared<double>(0.0));
+          temp_write.value_ptr_vec.push_back(
+            std::make_shared<double>(InitialCommandValue(gpio, it.name)));
         }
         hdl_trans_commands_.push_back(temp_write);
       } else if (gpio.parameters.at("type") == "controller") {
@@ -1465,7 +1487,8 @@ bool DynamixelHardware::InitDxlWriteItems()
           //   continue;
           // }
           temp_write.interface_name_vec.push_back(it.name);
-          temp_write.value_ptr_vec.push_back(std::make_shared<double>(0.0));
+          temp_write.value_ptr_vec.push_back(
+            std::make_shared<double>(InitialCommandValue(gpio, it.name)));
         }
         hdl_trans_commands_.push_back(temp_write);
       }

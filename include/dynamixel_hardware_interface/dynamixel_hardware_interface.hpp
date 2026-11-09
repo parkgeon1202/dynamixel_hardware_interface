@@ -336,6 +336,8 @@ private:
    * @return True if initialization was successful, false otherwise.
    */
   bool InitDxlWriteItems();
+  double InitialCommandValue(
+    const hardware_interface::ComponentInfo & gpio, const std::string & name) const;
 
   /**
    * @brief Reads sensor data.
