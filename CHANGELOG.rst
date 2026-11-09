@@ -2,6 +2,16 @@
 Changelog for package dynamixel_hardware_interface
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+Forthcoming (fork: parkgeon1202/kid_rl)
+---------------------------------------
+* Unofficial fork changes for the kid_rl walking controller; see "About this fork" in README.md
+* Input Voltage Error treated as diagnostic-only
+* Optional use_fast_read_protocol, track_sync_read_rx (rx_missing_id), bus_timing gpio, read_timeout_ms, write_on_read_failure
+* SyncWrite only on command change; transmit-only failures detected
+* Torque off in on_error / on_shutdown; gpio commands start from matching <param>
+* Fixed write buffer leak, addParam failure wedging the write path, exit(-1) in on_init, size checks
+* Contributors: parkgeon1202
+
 1.5.2 (2026-02-04)
 ------------------
 * Added xm335_t323 model file

@@ -13,6 +13,11 @@
 // limitations under the License.
 //
 // Authors: Hye-Jong KIM, Sungho Woo, Woojin Wie
+//
+// Modifications Copyright 2026 parkgeon1202 (kid_rl): input-voltage alert handling,
+// SyncRead RX tracking, bus timing diagnostics, read timeout, write-on-change,
+// on_error/on_shutdown torque-off, gpio command initial values, and bug fixes.
+// See the "About this fork" section of README.md.
 
 #include "dynamixel_hardware_interface/dynamixel_hardware_interface.hpp"
 
