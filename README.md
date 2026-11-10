@@ -36,7 +36,13 @@ source install/setup.bash
 
 Only the hardware interface is forked. DynamixelSDK and dynamixel_interfaces are the ROBOTIS packages, and this driver builds against them unchanged. The fork was developed and tested on ROS 2 Jazzy.
 
-The kid_rl competition branches (`for_irc_contest`, `irc_hurdle`) additionally need five messages added to `dynamixel_interfaces`. The driver does not use them. See [§5](#5-extra-dynamixel_interfaces-messages-for-the-irc-competition).
+The kid_rl competition branches (`for_irc_contest`, `irc_hurdle`) additionally need five messages added to `dynamixel_interfaces`. The driver does not use them. For those branches, clone the [dynamixel_interfaces fork](https://github.com/parkgeon1202/dynamixel_interfaces/tree/kid-rl) instead of the ROBOTIS one:
+
+```bash
+git clone -b kid-rl https://github.com/parkgeon1202/dynamixel_interfaces.git
+```
+
+See [§5](#5-extra-dynamixel_interfaces-messages-for-the-irc-competition).
 
 ---
 
@@ -91,7 +97,7 @@ From `for_irc_contest` on, kid_rl replaces the team's previous DYNAMIXEL node. I
 
 ## 5. Extra dynamixel_interfaces messages for the IRC competition
 
-These five messages are **not** part of [ROBOTIS-GIT/dynamixel_interfaces](https://github.com/ROBOTIS-GIT/dynamixel_interfaces), and this driver does not use them. They were added to `dynamixel_interfaces` so that kid_rl (`for_irc_contest`, `irc_hurdle`) can exchange motor commands and motor states with the other IRC competition packages.
+These five messages are **not** part of [ROBOTIS-GIT/dynamixel_interfaces](https://github.com/ROBOTIS-GIT/dynamixel_interfaces), and this driver does not use them. They are published in the fork [parkgeon1202/dynamixel_interfaces](https://github.com/parkgeon1202/dynamixel_interfaces/tree/kid-rl) (branch `kid-rl`). They were added to `dynamixel_interfaces` so that kid_rl (`for_irc_contest`, `irc_hurdle`) can exchange motor commands and motor states with the other IRC competition packages.
 
 They keep the fields of the messages that the team's previous DYNAMIXEL node used, and add a servo `id` to every motor element. The previous node matched motors by their position in the array. kid_rl matches them by `id` instead, using the `ID` of each `<joint>_dxl` gpio in `robot_description`. So the array order does not matter, a message may name only some motors, and a message that contains an unknown or duplicate `id` or a non-finite value is dropped as a whole.
 
@@ -106,7 +112,7 @@ Profile velocity and acceleration are not written to the servos. kid_rl emulates
 
 ### Definitions
 
-Add these files to `dynamixel_interfaces/msg/`:
+The fork contains these files in `msg/` (comments shortened here):
 
 ```
 # DynamixelMsgs.msg — command for one motor
@@ -141,7 +147,7 @@ std_msgs/Header header  # stamp = the control tick that read these states
 DynamixelMotorState[] motor_state
 ```
 
-and list them in `rosidl_generate_interfaces()` in its `CMakeLists.txt`:
+and lists them in `rosidl_generate_interfaces()` in its `CMakeLists.txt`:
 
 ```cmake
 rosidl_generate_interfaces(${PROJECT_NAME}
